@@ -27,7 +27,7 @@ import asyncio
 import inspect
 import sys
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Type, Union, cast
 
 from loguru import logger
 from pipecat.frames.frames import (
@@ -72,6 +72,13 @@ if TYPE_CHECKING:
 else:
     LLMService = Any
 
+# Forward declaration for MCPClient type hint
+if TYPE_CHECKING:
+    # Assuming MCPClient.py (after renaming from .text) is in a location
+    # Python can find it, e.g., project root added to PYTHONPATH, or moved into src.
+    from MCPClient import MCPClient
+else:
+    MCPClient = Any
 
 class FlowManager:
     """Manages conversation flows, supporting both static and dynamic configurations.
@@ -154,6 +161,7 @@ class FlowManager:
 
         self._showed_deprecation_warning_for_transition_fields = False
         self._showed_deprecation_warning_for_set_node = False
+        self.mcp_clients: Dict[str, MCPClient] = {}
 
     def _validate_transition_callback(self, name: str, callback: Any) -> None:
         """Validate a transition callback.
@@ -235,6 +243,27 @@ class FlowManager:
             flow_manager.register_action("notify", custom_notification)
         """
         self.action_manager._register_action(action_type, handler)
+
+    def register_mcp(self, name: str, mcp: MCPClient) -> None:
+        """Register an MCP client with a given name.
+
+        Args:
+            name: A string identifier for the MCP client.
+            mcp: An instance of the MCPClient class.
+        """
+        if MCPClient is not Any and not isinstance(mcp, MCPClient):
+            raise TypeError(f"Expected mcp to be an instance of MCPClient, got {type(mcp)}")
+        elif MCPClient is Any:
+            # If MCPClient is Any, we can't do a strong runtime type check.
+            # We'll log a warning if it doesn't seem to have the 'register_tools' method.
+            if not hasattr(mcp, 'register_tools') or not callable(mcp.register_tools):
+                logger.warning(f"Registered MCP client '{name}' does not appear to have a callable 'register_tools' method.")
+            logger.debug("MCPClient type is Any, runtime type check for 'mcp' parameter in register_mcp is limited.")
+
+        if name in self.mcp_clients:
+            logger.warning(f"MCP client with name '{name}' already registered. Overwriting.")
+        self.mcp_clients[name] = mcp
+        logger.debug(f"Registered MCP client: {name}")
 
     def _register_action_from_config(self, action: ActionConfig) -> None:
         """Register an action handler from action configuration.
@@ -528,6 +557,7 @@ class FlowManager:
         Raises:
             FlowError: If function registration fails
         """
+        logger.debug(f"Registering function: {name}")
         if name not in self.current_functions:
             try:
                 # Handle special token format (e.g. "__function__:function_name")
@@ -539,7 +569,7 @@ class FlowManager:
                 transition_func = await self._create_transition_func(
                     name, handler, transition_to, transition_callback
                 )
-
+                logger.debug(f"Created transition function for {name}: {transition_func}")
                 # Register function with LLM
                 self.llm.register_function(
                     name,
@@ -615,7 +645,7 @@ In all of these cases, you can provide a `name` in your new node's config for de
 
         try:
             self._validate_node_config(node_id, node_config)
-            logger.debug(f"Setting node: {node_id}")
+            logger.debug(f"Setting node (blah): {node_id}")
 
             # Clear any deferred post-actions from previous node
             self.action_manager.clear_deferred_post_actions()
@@ -644,6 +674,7 @@ In all of these cases, you can provide a `name` in your new node's config for de
 
             # Get functions list with default empty list if not provided
             functions_list = node_config.get("functions", [])
+            logger.debug(f"Functions list: {functions_list}")
 
             async def register_function_schema(schema: FlowsFunctionSchema):
                 """Helper to register a single FlowsFunctionSchema."""
@@ -670,6 +701,7 @@ In all of these cases, you can provide a `name` in your new node's config for de
 
             for func_config in functions_list:
                 # Handle direct functions
+                logger.debug(f"Processing function config: {func_config}")
                 if callable(func_config):
                     await register_direct_function(func_config)
                 # Handle Gemini's nested function declarations as a special case
@@ -692,11 +724,33 @@ In all of these cases, you can provide a `name` in your new node's config for de
                     )
                     await register_function_schema(schema)
 
+            # Register MCP tools if specified
+            if mcp_client_name := node_config.get("mcp"):
+                if mcp_client_name in self.mcp_clients:
+                    mcp_client = self.mcp_clients[mcp_client_name]
+                    try:
+                        logger.debug(f"Registering tools for MCP client: {mcp_client_name}")
+                        mcp_tools_schema = await mcp_client.register_tools(self.llm)
+                        if mcp_tools_schema and mcp_tools_schema.standard_tools:
+                            for mcp_tool in mcp_tools_schema.standard_tools:
+                                tools.append(mcp_tool)
+                                logger.debug(f"Added MCP tool: {mcp_tool.name}")
+                        else:
+                            logger.debug(f"MCP client '{mcp_client_name}' provided no standard tools.")
+                    except Exception as e:
+                        logger.error(f"Error registering tools for MCP client '{mcp_client_name}': {e}")
+                else:
+                    logger.warning(f"MCP client '{mcp_client_name}' specified in node_config but not registered.")
+
+
             # Create ToolsSchema with standard function schemas
             standard_functions = []
             for tool in tools:
                 # Convert FlowsFunctionSchema to standard FunctionSchema for the LLM
-                standard_functions.append(tool.to_function_schema())
+                if (isinstance(tool, FlowsFunctionSchema) or isinstance(tool, FlowsDirectFunction)):
+                    standard_functions.append(tool.to_function_schema())                    
+                else:
+                    standard_functions.append(tool)
 
             # Use provider adapter to format tools, passing original configs for Gemini adapter
             formatted_tools = self.adapter.format_functions(
